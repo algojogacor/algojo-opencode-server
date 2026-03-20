@@ -4,7 +4,7 @@
 // ╚══════════════════════════════════════════════════════════════╝
 
 const express = require('express');
-const { exec } = require('child_process');
+const { exec, spawn } = require('child_process');
 const https = require('https');
 const path = require('path');
 const fs = require('fs');
@@ -97,9 +97,16 @@ app.use((req, res, next) => {
 // ══════════════════════════════════════════════════════════════
 function run(cmd, options = {}) {
     return new Promise((resolve, reject) => {
-        exec(cmd, { timeout: 300000, ...options }, (error, stdout, stderr) => {
-            if (error) reject(new Error(stderr || error.message));
-            else resolve(stdout);
+        exec(cmd, { timeout: 300000, maxBuffer: 1024 * 1024 * 10, ...options }, (error, stdout, stderr) => {
+            if (error) {
+                // Sensor token agar tidak bocor di log
+                const safeMsg = (stderr || error.message)
+                    .replace(GITHUB_TOKEN || '', '[TOKEN]')
+                    .replace(OLLAMA_API_KEY || '', '[TOKEN]');
+                reject(new Error(safeMsg));
+            } else {
+                resolve(stdout);
+            }
         });
     });
 }
@@ -116,13 +123,39 @@ async function setupRepo() {
 }
 
 function runOpenCode(prompt, sessionId = null) {
-    const safePrompt = prompt.replace(/'/g, "'\\''");
-    const sessionFlag = sessionId ? `--session ${sessionId} --continue` : '';
-    const cmd = `cd ${BOT_DIR} && opencode run ${sessionFlag} '${safePrompt}'`;
     return new Promise((resolve) => {
-        exec(cmd, { timeout: 300000 }, (error, stdout, stderr) => {
-            resolve({ stdout: stdout || '', stderr: stderr || '', error });
+        // Gunakan spawn (lebih aman dari exec — tidak lewat shell)
+        const spawnArgs = ['run'];
+        if (sessionId) {
+            spawnArgs.push('--session', sessionId, '--continue');
+        }
+        spawnArgs.push(prompt); // prompt sebagai argumen langsung, tidak lewat shell
+
+        const child = spawn('opencode', spawnArgs, {
+            cwd: BOT_DIR,
+            timeout: 300000,
+            env: { ...process.env }
         });
+
+        let stdout = '';
+        let stderr = '';
+
+        child.stdout.on('data', d => { stdout += d.toString(); });
+        child.stderr.on('data', d => { stderr += d.toString(); });
+
+        child.on('close', () => {
+            resolve({ stdout, stderr, error: null });
+        });
+
+        child.on('error', (err) => {
+            resolve({ stdout, stderr, error: err });
+        });
+
+        // Safety timeout
+        setTimeout(() => {
+            child.kill();
+            resolve({ stdout, stderr, error: new Error('Timeout') });
+        }, 290000);
     });
 }
 
@@ -410,16 +443,36 @@ app.post('/build', async (req, res) => {
 
     const queuePos = queue.length + (isProcessing ? 1 : 0);
 
+    // Tolak kalau antrian sudah penuh
     if (queuePos >= 3) {
-        return res.json({ success: false, queued: false, message: `Server sibuk (${queuePos} antri). Coba lagi nanti!` });
+        return res.json({
+            success: false,
+            queued: false,
+            message: `Server sibuk (${queuePos} antri). Coba lagi nanti!`
+        });
     }
 
+    // Kalau ada antrian → balas dulu ke client, proses di background via webhook
     if (queuePos > 0) {
-        // Proses di background
-        addToQueue({ prompt, requester, groupId, forceUpdate }).catch(console.error);
-        return res.json({ success: false, queued: true, position: queuePos, message: `Antrian ke-${queuePos}, estimasi ${queuePos * 3} menit.` });
+        // Balas HTTP dulu biar client tidak timeout
+        res.json({
+            success: false,
+            queued: true,
+            position: queuePos,
+            message: `Antrian ke-${queuePos}, estimasi ${queuePos * 3} menit.`
+        });
+        // Proses di background, kirim hasil via webhook ke bot WA
+        addToQueue({ prompt, requester, groupId, forceUpdate })
+            .then(result => {
+                if (groupId) sendWebhook({ type: 'queue_done', groupId, result });
+            })
+            .catch(e => {
+                if (groupId) sendWebhook({ type: 'queue_error', groupId, error: e.message });
+            });
+        return;
     }
 
+    // Langsung proses kalau tidak ada antrian
     try {
         const result = await addToQueue({ prompt, requester, groupId, forceUpdate });
         res.json(result);
