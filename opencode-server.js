@@ -1,6 +1,6 @@
 // ╔══════════════════════════════════════════════════════════════╗
-// ║        ALGOJO OPENCODE SERVER                               ║
-// ║  Menerima request dari Bot WA → jalankan OpenCode           ║
+// ║        ALGOJO OPENCODE SERVER v2 — Railway                  ║
+// ║  Support: iterasi loop, session memory, auto-fix            ║
 // ╚══════════════════════════════════════════════════════════════╝
 
 const express = require('express');
@@ -9,7 +9,7 @@ const path = require('path');
 const fs = require('fs');
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.OPENCODE_API_KEY || 'rahasia123';
@@ -17,13 +17,13 @@ const BOT_REPO = process.env.BOT_REPO || 'https://github.com/algojogacor/BOT-DIS
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY;
 const BOT_DIR = '/tmp/bot';
+const MAX_ITERATIONS = 5; // batas maksimal loop
 
-// Set Ollama API key ke environment
 if (OLLAMA_API_KEY) process.env.OLLAMA_API_KEY = OLLAMA_API_KEY;
 
 // ── Auth Middleware ──────────────────────────────────────────
 app.use((req, res, next) => {
-    if (req.path === '/') return next(); // health check bebas
+    if (req.path === '/') return next();
     const key = req.headers['x-api-key'];
     if (key !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
     next();
@@ -51,13 +51,30 @@ async function setupRepo() {
     }
 }
 
-// ── Jalankan OpenCode ────────────────────────────────────────
-function runOpenCode(prompt) {
+// ── Jalankan OpenCode dengan session ────────────────────────
+function runOpenCode(prompt, sessionId = null) {
     const safePrompt = prompt.replace(/'/g, "'\\''");
-    return run(`cd ${BOT_DIR} && opencode run '${safePrompt}'`);
+    const sessionFlag = sessionId ? `--session ${sessionId}` : '';
+    const cmd = `cd ${BOT_DIR} && opencode run ${sessionFlag} '${safePrompt}'`;
+    return new Promise((resolve, reject) => {
+        exec(cmd, { timeout: 300000 }, (error, stdout, stderr) => {
+            // Tetap resolve meski ada error — output tetap berguna
+            resolve({ stdout: stdout || '', stderr: stderr || '', error });
+        });
+    });
 }
 
-// ── Deteksi file baru di /commands/nemo/ ─────────────────────
+// ── Parse JSON signal dari output OpenCode ───────────────────
+function parseSignal(output) {
+    try {
+        // Cari JSON di akhir output
+        const jsonMatch = output.match(/\{[^{}]*"status"\s*:\s*"(done|continue|question|error)"[^{}]*\}/);
+        if (jsonMatch) return JSON.parse(jsonMatch[0]);
+    } catch(e) {}
+    return null;
+}
+
+// ── Deteksi file baru ────────────────────────────────────────
 function detectNewFiles(before) {
     const nemoDir = path.join(BOT_DIR, 'commands', 'nemo');
     if (!fs.existsSync(nemoDir)) return [];
@@ -65,32 +82,64 @@ function detectNewFiles(before) {
     return [...after].filter(f => !before.has(f));
 }
 
+// ── Deteksi file yang berubah ────────────────────────────────
+function detectChangedFiles(filenames) {
+    return filenames.filter(f => {
+        const filepath = path.join(BOT_DIR, 'commands', 'nemo', f);
+        return fs.existsSync(filepath);
+    });
+}
+
 // ── Git push ─────────────────────────────────────────────────
-async function gitPush(filename) {
+async function gitPush(filename, isfix = false) {
     const repoUrl = BOT_REPO.replace('https://', `https://${GITHUB_TOKEN}@`);
     const cmdName = filename.replace('.js', '');
+    const msg = isfix
+        ? `fix: perbaiki fitur ${cmdName} by Algojo AI`
+        : `feat: tambah fitur ${cmdName} by Algojo AI`;
     await run([
         `cd ${BOT_DIR}`,
         `git remote set-url origin ${repoUrl}`,
         `git add commands/nemo/${filename}`,
-        `git commit -m "feat: tambah fitur ${cmdName} by Algojo AI"`,
+        `git commit -m "${msg}"`,
         `git push origin main`
     ].join(' && '));
+}
+
+// ── SYSTEM PROMPT untuk OpenCode ────────────────────────────
+function buildSystemPrompt(basePrompt, context = '') {
+    return `${basePrompt}
+
+PENTING — Format response kamu:
+1. Tulis kode lengkap di file commands/nemo/<namafitur>.js
+2. Format modul WAJIB:
+   module.exports = async (command, args, msg, user, db, sock, m) => {
+       if (command !== 'namacommand') return;
+       // logika fitur
+       await msg.reply(hasil);
+   };
+3. Di AKHIR response, tulis SALAH SATU JSON signal ini:
+   - Kalau SELESAI: {"status":"done","file":"namafile.js"}
+   - Kalau PERLU LANJUT: {"status":"continue","hint":"apa yang harus dilanjutkan"}
+   - Kalau ADA PERTANYAAN: {"status":"question","ask":"pertanyaan kamu"}
+
+${context ? `Konteks tambahan:\n${context}` : ''}`;
 }
 
 // ── ENDPOINT: Health Check ───────────────────────────────────
 app.get('/', (req, res) => {
     res.json({
         status: 'running',
+        version: '2.0',
         service: 'Algojo OpenCode Server',
         ollama: !!OLLAMA_API_KEY,
         github: !!GITHUB_TOKEN
     });
 });
 
-// ── ENDPOINT: Build Feature ──────────────────────────────────
+// ── ENDPOINT: Build Feature (dengan iterasi loop) ────────────
 app.post('/build', async (req, res) => {
-    const { prompt } = req.body;
+    const { prompt, requester } = req.body;
     if (!prompt) return res.status(400).json({ error: 'prompt required' });
 
     console.log(`[Build] Request: ${prompt}`);
@@ -102,27 +151,147 @@ app.post('/build', async (req, res) => {
         if (!fs.existsSync(nemoDir)) fs.mkdirSync(nemoDir, { recursive: true });
         const filesBefore = new Set(fs.readdirSync(nemoDir).filter(f => f.endsWith('.js')));
 
-        const fullPrompt = `${prompt}. Simpan file baru di commands/nemo/ sesuai nama fitur. Format modul wajib: module.exports = async (command, args, msg, user, db, sock, m) => { if (command !== 'namacommand') return; ... await msg.reply(hasil); }`;
-        await runOpenCode(fullPrompt);
+        let sessionId = null;
+        let iteration = 0;
+        let lastHint = '';
+        let finalFile = null;
+        let questions = [];
 
-        const newFiles = detectNewFiles(filesBefore);
-        if (newFiles.length === 0) {
-            return res.json({ success: false, message: 'OpenCode selesai tapi tidak ada file baru' });
+        // ── Loop iterasi ─────────────────────────────────────
+        while (iteration < MAX_ITERATIONS) {
+            iteration++;
+            console.log(`[Build] Iterasi ${iteration}/${MAX_ITERATIONS}`);
+
+            const systemPrompt = iteration === 1
+                ? buildSystemPrompt(prompt)
+                : buildSystemPrompt(`Lanjutkan pembuatan fitur sebelumnya. ${lastHint}`, `Ini adalah iterasi ke-${iteration}`);
+
+            const result = await runOpenCode(systemPrompt, sessionId);
+            const output = result.stdout;
+
+            console.log(`[Build] Output iterasi ${iteration}: ${output.slice(-200)}`);
+
+            // Parse signal JSON dari output
+            const signal = parseSignal(output);
+
+            if (signal) {
+                if (signal.status === 'done') {
+                    finalFile = signal.file;
+                    console.log(`[Build] AI selesai, file: ${finalFile}`);
+                    break;
+                } else if (signal.status === 'continue') {
+                    lastHint = signal.hint || 'lanjutkan';
+                    console.log(`[Build] AI minta lanjut: ${lastHint}`);
+                    continue;
+                } else if (signal.status === 'question') {
+                    questions.push(signal.ask);
+                    console.log(`[Build] AI bertanya: ${signal.ask}`);
+                    // Jawab otomatis: lanjut saja dengan best guess
+                    lastHint = `Asumsikan pilihan terbaik dan lanjutkan pembuatan fitur`;
+                    continue;
+                }
+            }
+
+            // Kalau tidak ada signal, cek apakah ada file baru
+            const newFiles = detectNewFiles(filesBefore);
+            if (newFiles.length > 0) {
+                finalFile = newFiles[0];
+                console.log(`[Build] File baru terdeteksi: ${finalFile}`);
+                break;
+            }
+
+            // Kalau tidak ada signal dan tidak ada file baru, lanjut
+            lastHint = 'Selesaikan pembuatan file dan simpan ke commands/nemo/';
         }
 
-        await gitPush(newFiles[0]);
+        // ── Cek hasil ────────────────────────────────────────
+        const newFiles = detectNewFiles(filesBefore);
+        if (newFiles.length === 0 && !finalFile) {
+            return res.json({
+                success: false,
+                iterations: iteration,
+                message: `Sudah ${iteration} iterasi tapi tidak ada file baru. Coba request lebih spesifik.`
+            });
+        }
 
-        const feature = newFiles[0].replace('.js', '');
-        console.log(`[Build] Berhasil: ${feature}`);
+        const targetFile = finalFile || newFiles[0];
+        const targetFilename = path.basename(targetFile);
+
+        // Push ke GitHub
+        await gitPush(targetFilename);
+
+        const feature = targetFilename.replace('.js', '');
+        console.log(`[Build] Berhasil setelah ${iteration} iterasi: ${feature}`);
 
         res.json({
             success: true,
             feature,
-            message: `Fitur !${feature} berhasil dibuat dan dipush ke GitHub!`
+            iterations: iteration,
+            questions: questions.length > 0 ? questions : undefined,
+            message: `Fitur !${feature} berhasil dibuat dalam ${iteration} iterasi!`
         });
 
     } catch (error) {
         console.error('[Build] Error:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// ── ENDPOINT: Fix Feature ────────────────────────────────────
+app.post('/fix', async (req, res) => {
+    const { feature, errorLog, manualLog } = req.body;
+    if (!feature) return res.status(400).json({ error: 'feature name required' });
+
+    console.log(`[Fix] Memperbaiki: ${feature}`);
+
+    try {
+        await setupRepo();
+
+        const featureFile = path.join(BOT_DIR, 'commands', 'nemo', `${feature}.js`);
+        if (!fs.existsSync(featureFile)) {
+            return res.status(404).json({ error: `File ${feature}.js tidak ditemukan` });
+        }
+
+        // Baca isi file yang error
+        const fileContent = fs.readFileSync(featureFile, 'utf8');
+        const errorInfo = errorLog || manualLog || 'Unknown error';
+
+        const fixPrompt = buildSystemPrompt(
+            `Perbaiki bug pada fitur !${feature} di file commands/nemo/${feature}.js`,
+            `Isi file saat ini:\n\`\`\`javascript\n${fileContent}\n\`\`\`\n\nError log:\n${errorInfo}\n\nPerbaiki bug tersebut dan simpan ulang file yang sama.`
+        );
+
+        let iteration = 0;
+        let fixed = false;
+
+        while (iteration < 3) {
+            iteration++;
+            console.log(`[Fix] Iterasi fix ${iteration}`);
+
+            const result = await runOpenCode(fixPrompt);
+            const signal = parseSignal(result.stdout);
+
+            if (signal?.status === 'done' || fs.existsSync(featureFile)) {
+                fixed = true;
+                break;
+            }
+        }
+
+        if (!fixed) {
+            return res.json({ success: false, message: 'Gagal memperbaiki setelah 3 percobaan' });
+        }
+
+        // Push fix ke GitHub
+        await gitPush(`${feature}.js`, true);
+
+        res.json({
+            success: true,
+            feature,
+            message: `Fitur !${feature} berhasil diperbaiki!`
+        });
+
+    } catch (error) {
+        console.error('[Fix] Error:', error.message);
         res.status(500).json({ success: false, error: error.message });
     }
 });
@@ -142,8 +311,9 @@ app.get('/features', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-    console.log(`🤖 Algojo OpenCode Server jalan di port ${PORT}`);
+    console.log(`🤖 Algojo OpenCode Server v2 jalan di port ${PORT}`);
     console.log(`📦 Bot repo: ${BOT_REPO}`);
     console.log(`🔑 Ollama: ${OLLAMA_API_KEY ? 'configured' : 'NOT SET'}`);
     console.log(`🔑 GitHub: ${GITHUB_TOKEN ? 'configured' : 'NOT SET'}`);
+    console.log(`🔄 Max iterasi: ${MAX_ITERATIONS}`);
 });
