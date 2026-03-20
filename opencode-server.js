@@ -226,47 +226,8 @@ function detectNewFiles(before) {
     return [...after].filter(f => !before.has(f));
 }
 
-// Cek duplikat dengan cara lebih cerdas
-// Bandingkan semua kata di prompt dengan semua nama fitur yang ada
-function checkDuplicate(prompt) {
-    const nemoDir = path.join(BOT_DIR, 'commands', 'nemo');
-    if (!fs.existsSync(nemoDir)) return null;
 
-    const existing = fs.readdirSync(nemoDir)
-        .filter(f => f.endsWith('.js'))
-        .map(f => f.replace('.js', '').toLowerCase());
 
-    if (existing.length === 0) return null;
-
-    // Bersihkan prompt dari kata-kata umum
-    const cleanPrompt = prompt.toLowerCase()
-        .replace(/buatkan|buatin|fitur|game|buat|tambah|feature|create|tolong|coba|jadikan|tambahkan/g, '')
-        .replace(/[^a-z0-9\s]/g, '')
-        .trim();
-
-    const promptWords = cleanPrompt.split(/\s+/).filter(w => w.length > 2);
-
-    // Cek exact match atau substring match
-    for (const name of existing) {
-        // Exact match dengan salah satu kata di prompt
-        if (promptWords.includes(name)) return name;
-
-        // Nama fitur ada di dalam prompt (misal "jadwalsholat" di "jadwal sholat")
-        if (cleanPrompt.replace(/\s/g, '').includes(name)) return name;
-
-        // Prompt mengandung semua kata yang ada di nama fitur
-        const nameWords = name.split(/(?=[A-Z])|_|-/).map(w => w.toLowerCase());
-        if (nameWords.length > 1 && nameWords.every(w => promptWords.includes(w))) return name;
-
-        // Fuzzy: minimal 80% kata prompt cocok dengan nama fitur
-        const matchCount = promptWords.filter(w =>
-            name.includes(w) || w.includes(name.slice(0, 4))
-        ).length;
-        if (matchCount >= 1 && name.length > 4 && promptWords.some(w => name.startsWith(w.slice(0, 4)))) return name;
-    }
-
-    return null;
-}
 
 // Bersihkan JSON signal yang nyasar ke dalam file JS
 function cleanSignalFromFiles(files) {
@@ -329,18 +290,6 @@ async function executeBuild({ prompt, requester, groupId, forceUpdate = false })
 
     const nemoDir = path.join(BOT_DIR, 'commands', 'nemo');
     if (!fs.existsSync(nemoDir)) fs.mkdirSync(nemoDir, { recursive: true });
-
-    // Anti-double check — lebih akurat
-    const existingFeature = !forceUpdate ? checkDuplicate(prompt) : null;
-    if (existingFeature) {
-        return {
-            success: false,
-            duplicate: true,
-            existingFeature,
-            groupId,
-            message: `Fitur !${existingFeature} sudah ada!`
-        };
-    }
 
     const filesBefore = new Set(fs.readdirSync(nemoDir).filter(f => f.endsWith('.js')));
     const sessionId = `algojo-${Date.now()}`;
