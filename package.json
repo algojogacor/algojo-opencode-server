@@ -1,0 +1,16 @@
+{
+  "name": "algojo-opencode-server",
+  "version": "1.0.0",
+  "description": "Algojo OpenCode Server - Build WA bot features via AI",
+  "main": "opencode-server.js",
+  "scripts": {
+    "start": "node opencode-server.js",
+    "postinstall": "npm install -g opencode-ai"
+  },
+  "dependencies": {
+    "express": "^4.18.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
