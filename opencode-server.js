@@ -285,6 +285,7 @@ function cleanSignalFromFiles(files) {
 }
 
 
+async function gitPushAll(files, isfix = false) {
     const repoUrl = BOT_REPO.replace('https://', `https://${GITHUB_TOKEN}@`);
     const commitMsg = isfix
         ? `fix: perbaiki fitur by Algojo AI`
