@@ -147,12 +147,14 @@ function runOpenCode(prompt, sessionId = null) {
 
         const child = spawn('opencode', spawnArgs, {
             cwd: BOT_DIR,
-            timeout: 300000,
             env: {
                 ...process.env,
                 FORCE_COLOR: '0',
                 NO_COLOR: '1',
-                CI: '1'  // banyak CLI disable buffer di CI mode
+                CI: '1',
+                // Model bisa diganti lewat env variable Railway
+                ...(process.env.OPENCODE_MODEL    && { OPENCODE_MODEL:    process.env.OPENCODE_MODEL }),
+                ...(process.env.OPENCODE_PROVIDER && { OPENCODE_PROVIDER: process.env.OPENCODE_PROVIDER }),
             }
         });
 
