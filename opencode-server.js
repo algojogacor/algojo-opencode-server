@@ -1,10 +1,11 @@
 // ╔══════════════════════════════════════════════════════════════╗
-// ║        ALGOJO OPENCODE SERVER v3 — Railway                  ║
-// ║  Queue, Anti-double, Multi-file, Iterasi Append Mode        ║
+// ║        ALGOJO OPENCODE SERVER v4 — Railway                  ║
+// ║  Queue, Anti-double, Multi-file, Log thinking, Webhook      ║
 // ╚══════════════════════════════════════════════════════════════╝
 
 const express = require('express');
 const { exec } = require('child_process');
+const https = require('https');
 const path = require('path');
 const fs = require('fs');
 
@@ -16,6 +17,8 @@ const API_KEY = process.env.OPENCODE_API_KEY || 'rahasia123';
 const BOT_REPO = process.env.BOT_REPO || 'https://github.com/algojogacor/BOT-DISCORD.git';
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY;
+const BOT_WEBHOOK_URL = process.env.BOT_WEBHOOK_URL || '';
+const BOT_WEBHOOK_KEY = process.env.BOT_WEBHOOK_KEY || 'rahasia123';
 const BOT_DIR = '/tmp/bot';
 const MAX_ITERATIONS = 5;
 
@@ -38,7 +41,7 @@ async function processQueue() {
         job.reject(e);
     } finally {
         isProcessing = false;
-        processQueue(); // proses job berikutnya
+        processQueue();
     }
 }
 
@@ -46,6 +49,36 @@ function addToQueue(data) {
     return new Promise((resolve, reject) => {
         queue.push({ data, resolve, reject });
         processQueue();
+    });
+}
+
+// ══════════════════════════════════════════════════════════════
+// WEBHOOK KE BOT WA
+// ══════════════════════════════════════════════════════════════
+function sendWebhook(payload) {
+    if (!BOT_WEBHOOK_URL) return Promise.resolve();
+    return new Promise((resolve) => {
+        try {
+            const body = JSON.stringify(payload);
+            const url = new URL(BOT_WEBHOOK_URL);
+            const options = {
+                hostname: url.hostname,
+                path: url.pathname,
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Content-Length': Buffer.byteLength(body),
+                    'x-webhook-key': BOT_WEBHOOK_KEY
+                }
+            };
+            const req = https.request(options, () => resolve());
+            req.on('error', () => resolve()); // jangan sampai crash
+            req.setTimeout(10000, () => { req.destroy(); resolve(); });
+            req.write(body);
+            req.end();
+        } catch(e) {
+            resolve();
+        }
     });
 }
 
@@ -101,7 +134,23 @@ function parseSignal(output) {
     return null;
 }
 
-// Deteksi SEMUA file baru (multi-file support)
+// Ekstrak thinking/log dari output (buang JSON signal)
+function extractThinking(output) {
+    return output
+        .replace(/\{[^{}]*"status"\s*:\s*"[^"]*"[^{}]*\}/g, '')
+        .replace(/```[^`]*```/g, '[kode tersimpan]')
+        .trim()
+        .slice(0, 2000); // max 2000 karakter
+}
+
+// Ekstrak cara penggunaan dari output
+function extractUsage(output, featureName) {
+    // Cari section usage/cara pakai di output
+    const usageMatch = output.match(/(?:cara\s*(?:pakai|penggunaan|use)|usage|command)[:\s]*([^\n]+(?:\n[^\n{]+)*)/i);
+    if (usageMatch) return usageMatch[1].trim().slice(0, 500);
+    return `Ketik !${featureName} untuk menggunakan fitur ini.`;
+}
+
 function detectNewFiles(before) {
     const nemoDir = path.join(BOT_DIR, 'commands', 'nemo');
     if (!fs.existsSync(nemoDir)) return [];
@@ -109,40 +158,23 @@ function detectNewFiles(before) {
     return [...after].filter(f => !before.has(f));
 }
 
-// Deteksi file yang BERUBAH (untuk append mode)
-function detectChangedFiles(before) {
-    const nemoDir = path.join(BOT_DIR, 'commands', 'nemo');
-    if (!fs.existsSync(nemoDir)) return [];
-    return [...before].filter(f => {
-        const fp = path.join(nemoDir, f);
-        if (!fs.existsSync(fp)) return false;
-        const stat = fs.statSync(fp);
-        return stat.mtimeMs > Date.now() - 30000; // berubah dalam 30 detik terakhir
-    });
-}
-
-// Cek apakah fitur sudah ada
 function featureExists(featureName) {
     const nemoDir = path.join(BOT_DIR, 'commands', 'nemo');
     return fs.existsSync(path.join(nemoDir, `${featureName}.js`));
 }
 
-// Ekstrak nama fitur yang mungkin dari prompt
 function extractFeatureName(prompt) {
     const words = prompt.toLowerCase()
         .replace(/buatkan|fitur|game|buat|tambah|feature|create/g, '')
-        .trim()
-        .split(/\s+/)
-        .filter(w => w.length > 2);
+        .trim().split(/\s+/).filter(w => w.length > 2);
     return words[0] || null;
 }
 
 async function gitPushAll(files, isfix = false) {
     const repoUrl = BOT_REPO.replace('https://', `https://${GITHUB_TOKEN}@`);
-    const fileList = files.join(' ');
     const commitMsg = isfix
         ? `fix: perbaiki fitur by Algojo AI`
-        : `feat: tambah fitur ${files.map(f => f.replace('.js','')).join(', ')} by Algojo AI`;
+        : `feat: tambah ${files.map(f => f.replace('.js','')).join(', ')} by Algojo AI`;
     await run([
         `cd ${BOT_DIR}`,
         `git remote set-url origin ${repoUrl}`,
@@ -157,17 +189,19 @@ function buildSystemPrompt(basePrompt, context = '') {
 
 PENTING — Aturan wajib:
 1. Simpan file di commands/nemo/<namafitur>.js
-2. Format modul WAJIB untuk SETIAP file:
+2. Format modul WAJIB:
    module.exports = async (command, args, msg, user, db, sock, m) => {
        if (command !== 'namacommand') return;
-       // logika fitur
        await msg.reply(hasil);
    };
-3. Kalau fitur kompleks butuh banyak file, buat semua file yang diperlukan
-4. Di AKHIR response tulis JSON signal:
-   - Selesai semua: {"status":"done","files":["file1.js","file2.js"]}
-   - Perlu lanjut:  {"status":"continue","hint":"apa yang dilanjutkan","files_so_far":["file1.js"]}
-   - Ada pertanyaan:{"status":"question","ask":"pertanyaan"}
+3. Tulis CARA PENGGUNAAN sebelum JSON signal, format:
+   CARA PAKAI:
+   • !namafitur → fungsi utama
+   • !namafitur <arg> → contoh dengan argumen
+4. Di AKHIR tulis JSON signal:
+   - Selesai: {"status":"done","files":["file1.js"],"usage":"cara singkat pakai fitur"}
+   - Lanjut:  {"status":"continue","hint":"apa dilanjutkan","files_so_far":["file1.js"]}
+   - Tanya:   {"status":"question","ask":"pertanyaan"}
 
 ${context ? `\nKonteks:\n${context}` : ''}`;
 }
@@ -175,32 +209,43 @@ ${context ? `\nKonteks:\n${context}` : ''}`;
 // ══════════════════════════════════════════════════════════════
 // CORE BUILD FUNCTION
 // ══════════════════════════════════════════════════════════════
-async function executeBuild({ prompt, requester, forceUpdate = false }) {
+async function executeBuild({ prompt, requester, groupId, forceUpdate = false }) {
     await setupRepo();
 
     const nemoDir = path.join(BOT_DIR, 'commands', 'nemo');
     if (!fs.existsSync(nemoDir)) fs.mkdirSync(nemoDir, { recursive: true });
 
-    // ── Anti-double check ──────────────────────────────────
+    // Anti-double check
     const possibleName = extractFeatureName(prompt);
     if (possibleName && featureExists(possibleName) && !forceUpdate) {
         return {
             success: false,
             duplicate: true,
             existingFeature: possibleName,
-            message: `Fitur !${possibleName} sudah ada! Mau update atau batal?`
+            groupId,
+            message: `Fitur !${possibleName} sudah ada!`
         };
     }
 
     const filesBefore = new Set(fs.readdirSync(nemoDir).filter(f => f.endsWith('.js')));
-
-    let sessionId = `algojo-${Date.now()}`;
+    const sessionId = `algojo-${Date.now()}`;
     let iteration = 0;
     let lastHint = '';
     let allNewFiles = [];
     let questions = [];
+    let allThinking = []; // kumpulkan semua thinking
+    let finalUsage = '';
 
-    // ── Iterasi loop dengan append mode ───────────────────
+    // Kirim notif mulai ke grup yang request
+    if (groupId) {
+        await sendWebhook({
+            type: 'build_start',
+            groupId,
+            prompt,
+            requester
+        });
+    }
+
     while (iteration < MAX_ITERATIONS) {
         iteration++;
         console.log(`[Build] Iterasi ${iteration}/${MAX_ITERATIONS}`);
@@ -209,49 +254,51 @@ async function executeBuild({ prompt, requester, forceUpdate = false }) {
         if (iteration === 1) {
             iterPrompt = buildSystemPrompt(prompt);
         } else {
-            // Append mode: lanjut dari yang sudah ada
             const existingFiles = allNewFiles.map(f => {
                 const fp = path.join(nemoDir, f);
                 return fs.existsSync(fp)
-                    ? `\n--- ${f} ---\n${fs.readFileSync(fp, 'utf8').slice(0, 1000)}...\n`
+                    ? `\n--- ${f} (${fs.readFileSync(fp,'utf8').split('\n').length} baris) ---\n${fs.readFileSync(fp,'utf8').slice(0,800)}...\n`
                     : '';
             }).join('');
 
             iterPrompt = buildSystemPrompt(
-                `Lanjutkan pembuatan fitur. ${lastHint}`,
-                `File yang sudah dibuat:\n${existingFiles}\n\nLanjutkan dari sini, jangan mulai ulang dari awal!`
+                `Lanjutkan: ${lastHint}`,
+                `File sudah dibuat:\n${existingFiles}\nLanjutkan dari sini, JANGAN mulai ulang!`
             );
         }
 
         const result = await runOpenCode(iterPrompt, iteration > 1 ? sessionId : null);
         const output = result.stdout;
 
-        // Deteksi file baru di iterasi ini
-        const newThisIteration = detectNewFiles(filesBefore);
-        newThisIteration.forEach(f => {
-            if (!allNewFiles.includes(f)) allNewFiles.push(f);
-        });
+        // Kumpulkan thinking dari iterasi ini
+        const thinking = extractThinking(output);
+        if (thinking) {
+            allThinking.push(`*Iterasi ${iteration}:*\n${thinking}`);
+        }
 
-        // Parse signal
+        // Kirim progress ke grup yang request (setiap iterasi)
+        if (groupId && iteration > 1) {
+            await sendWebhook({
+                type: 'build_progress',
+                groupId,
+                iteration,
+                thinking: thinking.slice(0, 500)
+            });
+        }
+
+        const newThisIter = detectNewFiles(filesBefore);
+        newThisIter.forEach(f => { if (!allNewFiles.includes(f)) allNewFiles.push(f); });
+
         const signal = parseSignal(output);
-        console.log(`[Build] Signal iterasi ${iteration}:`, signal);
 
         if (signal) {
             if (signal.status === 'done') {
-                // Merge files dari signal jika ada
-                if (signal.files) {
-                    signal.files.forEach(f => {
-                        if (!allNewFiles.includes(f)) allNewFiles.push(f);
-                    });
-                }
+                if (signal.files) signal.files.forEach(f => { if (!allNewFiles.includes(f)) allNewFiles.push(f); });
+                if (signal.usage) finalUsage = signal.usage;
                 break;
             } else if (signal.status === 'continue') {
-                lastHint = signal.hint || 'lanjutkan implementasi';
-                if (signal.files_so_far) {
-                    signal.files_so_far.forEach(f => {
-                        if (!allNewFiles.includes(f)) allNewFiles.push(f);
-                    });
-                }
+                lastHint = signal.hint || 'lanjutkan';
+                if (signal.files_so_far) signal.files_so_far.forEach(f => { if (!allNewFiles.includes(f)) allNewFiles.push(f); });
                 continue;
             } else if (signal.status === 'question') {
                 questions.push(signal.ask);
@@ -260,169 +307,165 @@ async function executeBuild({ prompt, requester, forceUpdate = false }) {
             }
         }
 
-        // Kalau tidak ada signal tapi ada file baru, anggap selesai
         if (allNewFiles.length > 0 && iteration >= 2) break;
     }
 
-    // ── Validasi hasil ────────────────────────────────────
-    const finalFiles = allNewFiles.filter(f =>
-        fs.existsSync(path.join(nemoDir, f))
-    );
+    const finalFiles = allNewFiles.filter(f => fs.existsSync(path.join(nemoDir, f)));
 
     if (finalFiles.length === 0) {
-        return {
-            success: false,
-            iterations: iteration,
-            message: `Sudah ${iteration} iterasi tapi tidak ada file. Coba request lebih spesifik.`
-        };
+        // Kirim log thinking meski gagal
+        if (groupId && allThinking.length > 0) {
+            await sendWebhook({
+                type: 'build_log',
+                groupId,
+                success: false,
+                iterations: iteration,
+                thinking: allThinking.join('\n\n─────\n\n').slice(0, 3000)
+            });
+        }
+        return { success: false, iterations: iteration, groupId, message: `Sudah ${iteration} iterasi tapi tidak ada file.` };
     }
 
-    // ── Push semua file sekaligus ─────────────────────────
     await gitPushAll(finalFiles);
 
     const features = finalFiles.map(f => f.replace('.js', ''));
-    console.log(`[Build] Berhasil: ${features.join(', ')} (${iteration} iterasi)`);
+
+    // Bangun usage text
+    if (!finalUsage) {
+        finalUsage = features.map(f => `• !${f} → gunakan fitur ${f}`).join('\n');
+    }
+
+    // Kirim log thinking lengkap ke grup yang request
+    if (groupId) {
+        await sendWebhook({
+            type: 'build_log',
+            groupId,
+            success: true,
+            features,
+            iterations: iteration,
+            thinking: allThinking.join('\n\n─────\n\n').slice(0, 3000),
+            usage: finalUsage,
+            requester
+        });
+    }
 
     return {
         success: true,
         features,
-        feature: features[0], // backward compat
+        feature: features[0],
         iterations: iteration,
+        usage: finalUsage,
+        thinking: allThinking.join('\n\n').slice(0, 1000),
         questions: questions.length > 0 ? questions : undefined,
-        message: `${features.length} fitur berhasil dibuat dalam ${iteration} iterasi!`
+        groupId,
+        message: `${features.length} fitur berhasil!`
     };
 }
 
 // ══════════════════════════════════════════════════════════════
 // ENDPOINTS
 // ══════════════════════════════════════════════════════════════
-
 app.get('/', (req, res) => {
     res.json({
-        status: 'running',
-        version: '3.0',
+        status: 'running', version: '4.0',
         service: 'Algojo OpenCode Server',
-        ollama: !!OLLAMA_API_KEY,
-        github: !!GITHUB_TOKEN,
-        queue: queue.length,
-        processing: isProcessing
+        ollama: !!OLLAMA_API_KEY, github: !!GITHUB_TOKEN,
+        queue: queue.length, processing: isProcessing
     });
 });
 
-// ── Build Feature ────────────────────────────────────────────
 app.post('/build', async (req, res) => {
-    const { prompt, requester, forceUpdate } = req.body;
+    const { prompt, requester, groupId, forceUpdate } = req.body;
     if (!prompt) return res.status(400).json({ error: 'prompt required' });
 
-    const queuePosition = queue.length + (isProcessing ? 1 : 0);
-    console.log(`[Build] Request masuk, posisi antrian: ${queuePosition}`);
+    const queuePos = queue.length + (isProcessing ? 1 : 0);
+
+    if (queuePos >= 3) {
+        return res.json({ success: false, queued: false, message: `Server sibuk (${queuePos} antri). Coba lagi nanti!` });
+    }
+
+    if (queuePos > 0) {
+        // Proses di background
+        addToQueue({ prompt, requester, groupId, forceUpdate }).catch(console.error);
+        return res.json({ success: false, queued: true, position: queuePos, message: `Antrian ke-${queuePos}, estimasi ${queuePos * 3} menit.` });
+    }
 
     try {
-        // Kalau antrian sudah 3+, tolak dulu
-        if (queuePosition >= 3) {
-            return res.json({
-                success: false,
-                queued: false,
-                message: `Server sedang sibuk (${queuePosition} request antri). Coba lagi nanti!`
-            });
-        }
-
-        // Kalau ada antrian, beri tahu posisi
-        if (queuePosition > 0) {
-            res.json({
-                success: false,
-                queued: true,
-                position: queuePosition,
-                message: `Request masuk antrian ke-${queuePosition}. Estimasi ${queuePosition * 3} menit.`
-            });
-            // Tetap proses di background
-            addToQueue({ prompt, requester, forceUpdate }).then(() => {
-                console.log(`[Queue] Job selesai untuk: ${prompt}`);
-            }).catch(e => {
-                console.error(`[Queue] Job error: ${e.message}`);
-            });
-            return;
-        }
-
-        // Langsung proses kalau tidak ada antrian
-        const result = await addToQueue({ prompt, requester, forceUpdate });
+        const result = await addToQueue({ prompt, requester, groupId, forceUpdate });
         res.json(result);
-
-    } catch (error) {
-        console.error('[Build] Error:', error.message);
+    } catch(error) {
         res.status(500).json({ success: false, error: error.message });
     }
 });
 
-// ── Fix Feature ──────────────────────────────────────────────
 app.post('/fix', async (req, res) => {
-    const { feature, errorLog, manualLog } = req.body;
-    if (!feature) return res.status(400).json({ error: 'feature name required' });
+    const { feature, errorLog, manualLog, groupId } = req.body;
+    if (!feature) return res.status(400).json({ error: 'feature required' });
 
     try {
         await setupRepo();
-
         const featureFile = path.join(BOT_DIR, 'commands', 'nemo', `${feature}.js`);
-        if (!fs.existsSync(featureFile)) {
-            return res.status(404).json({ error: `File ${feature}.js tidak ditemukan` });
-        }
+        if (!fs.existsSync(featureFile)) return res.status(404).json({ error: `${feature}.js tidak ditemukan` });
 
         const fileContent = fs.readFileSync(featureFile, 'utf8');
         const errorInfo = errorLog || manualLog || 'Unknown error';
 
         const fixPrompt = buildSystemPrompt(
             `Perbaiki bug pada fitur !${feature}`,
-            `File saat ini:\n\`\`\`javascript\n${fileContent}\n\`\`\`\n\nError:\n${errorInfo}\n\nPerbaiki dan simpan ulang file yang SAMA (jangan buat file baru).`
+            `File saat ini:\n\`\`\`javascript\n${fileContent}\n\`\`\`\n\nError:\n${errorInfo}\n\nPerbaiki file yang SAMA.`
         );
 
         let fixed = false;
+        let fixThinking = [];
+
         for (let i = 0; i < 3; i++) {
             const result = await runOpenCode(fixPrompt);
-            const signal = parseSignal(result.stdout);
-            if (signal?.status === 'done' || fs.existsSync(featureFile)) {
-                fixed = true;
-                break;
+            const thinking = extractThinking(result.stdout);
+            if (thinking) fixThinking.push(`Fix iterasi ${i+1}:\n${thinking}`);
+            if (parseSignal(result.stdout)?.status === 'done' || fs.existsSync(featureFile)) {
+                fixed = true; break;
             }
         }
 
-        if (!fixed) return res.json({ success: false, message: 'Gagal fix setelah 3x percobaan' });
+        if (!fixed) return res.json({ success: false, message: 'Gagal fix setelah 3x' });
 
         await gitPushAll([`${feature}.js`], true);
-        res.json({ success: true, feature, message: `!${feature} berhasil diperbaiki!` });
 
-    } catch (error) {
+        // Kirim log fix ke grup
+        if (groupId) {
+            await sendWebhook({
+                type: 'fix_log',
+                groupId,
+                feature,
+                thinking: fixThinking.join('\n\n').slice(0, 2000)
+            });
+        }
+
+        res.json({ success: true, feature });
+    } catch(error) {
         res.status(500).json({ success: false, error: error.message });
     }
 });
 
-// ── Queue Status ─────────────────────────────────────────────
 app.get('/queue', (req, res) => {
-    res.json({
-        queue: queue.length,
-        processing: isProcessing,
-        total: queue.length + (isProcessing ? 1 : 0)
-    });
+    res.json({ queue: queue.length, processing: isProcessing, total: queue.length + (isProcessing ? 1 : 0) });
 });
 
-// ── List Features ────────────────────────────────────────────
 app.get('/features', async (req, res) => {
     try {
         await setupRepo();
         const nemoDir = path.join(BOT_DIR, 'commands', 'nemo');
         const files = fs.existsSync(nemoDir)
-            ? fs.readdirSync(nemoDir).filter(f => f.endsWith('.js')).map(f => f.replace('.js', ''))
+            ? fs.readdirSync(nemoDir).filter(f => f.endsWith('.js')).map(f => f.replace('.js',''))
             : [];
         res.json({ features: files, count: files.length });
-    } catch (error) {
+    } catch(error) {
         res.status(500).json({ error: error.message });
     }
 });
 
 app.listen(PORT, () => {
-    console.log(`🤖 Algojo OpenCode Server v3 jalan di port ${PORT}`);
-    console.log(`📦 Bot repo: ${BOT_REPO}`);
-    console.log(`🔑 Ollama: ${OLLAMA_API_KEY ? 'configured' : 'NOT SET'}`);
-    console.log(`🔑 GitHub: ${GITHUB_TOKEN ? 'configured' : 'NOT SET'}`);
-    console.log(`🔄 Max iterasi: ${MAX_ITERATIONS}`);
-    console.log(`📬 Queue: aktif`);
+    console.log(`🤖 Algojo OpenCode Server v4 — port ${PORT}`);
+    console.log(`🔑 Ollama: ${OLLAMA_API_KEY ? 'OK' : 'NOT SET'} | GitHub: ${GITHUB_TOKEN ? 'OK' : 'NOT SET'}`);
+    console.log(`🌐 Webhook: ${BOT_WEBHOOK_URL || 'NOT SET'}`);
 });
