@@ -1,0 +1,8 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "qwen3-coder:480b-cloud",
+  "provider": "ollama",
+  "tools": {
+    "web_search": true
+  }
+}
