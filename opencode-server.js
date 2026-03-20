@@ -83,8 +83,19 @@ function sendWebhook(payload) {
 }
 
 // ══════════════════════════════════════════════════════════════
-// AUTH MIDDLEWARE
+// IN-MEMORY LOG BUFFER — untuk polling dari luar
 // ══════════════════════════════════════════════════════════════
+const buildLogs = [];
+const MAX_LOGS = 100;
+
+function addLog(msg) {
+    const entry = `[${new Date().toISOString()}] ${msg}`;
+    console.log(entry);
+    buildLogs.push(entry);
+    if (buildLogs.length > MAX_LOGS) buildLogs.shift();
+}
+
+
 app.use((req, res, next) => {
     if (req.path === '/') return next();
     const key = req.headers['x-api-key'];
@@ -124,35 +135,57 @@ async function setupRepo() {
 
 function runOpenCode(prompt, sessionId = null) {
     return new Promise((resolve) => {
-        // Gunakan spawn (lebih aman dari exec — tidak lewat shell)
         const spawnArgs = ['run'];
         if (sessionId) {
             spawnArgs.push('--session', sessionId, '--continue');
         }
-        spawnArgs.push(prompt); // prompt sebagai argumen langsung, tidak lewat shell
+        spawnArgs.push(prompt);
+
+        console.log(`[OpenCode] Menjalankan: ${prompt.slice(0, 80)}...`);
+        addLog(`OpenCode start: ${prompt.slice(0, 80)}`);
+        if (sessionId) addLog(`Session: ${sessionId}`);
 
         const child = spawn('opencode', spawnArgs, {
             cwd: BOT_DIR,
             timeout: 300000,
-            env: { ...process.env }
+            env: {
+                ...process.env,
+                FORCE_COLOR: '0',
+                NO_COLOR: '1',
+                CI: '1'  // banyak CLI disable buffer di CI mode
+            }
         });
 
         let stdout = '';
         let stderr = '';
 
-        child.stdout.on('data', d => { stdout += d.toString(); });
-        child.stderr.on('data', d => { stderr += d.toString(); });
+        child.stdout.on('data', d => {
+            const chunk = d.toString();
+            stdout += chunk;
+            process.stdout.write(`[OpenCode Output] ${chunk}`);
+            // Simpan ke buffer untuk polling
+            addLog(`AI: ${chunk.slice(0, 200)}`);
+        });
 
-        child.on('close', () => {
+        child.stderr.on('data', d => {
+            const chunk = d.toString();
+            stderr += chunk;
+            process.stderr.write(`[OpenCode Stderr] ${chunk}`);
+        });
+
+        child.on('close', (code) => {
+            console.log(`[OpenCode] Selesai dengan exit code: ${code}`);
+            console.log(`[OpenCode] Total output: ${stdout.length} chars`);
             resolve({ stdout, stderr, error: null });
         });
 
         child.on('error', (err) => {
+            console.error(`[OpenCode] Error:`, err.message);
             resolve({ stdout, stderr, error: err });
         });
 
-        // Safety timeout
         setTimeout(() => {
+            console.log('[OpenCode] TIMEOUT — killing process');
             child.kill();
             resolve({ stdout, stderr, error: new Error('Timeout') });
         }, 290000);
@@ -353,24 +386,38 @@ async function executeBuild({ prompt, requester, groupId, forceUpdate = false })
         newThisIter.forEach(f => { if (!allNewFiles.includes(f)) allNewFiles.push(f); });
 
         const signal = parseSignal(output);
+        addLog(`[Build] Iterasi ${iteration} signal: ${signal ? signal.status : 'none'}, files baru: ${newThisIter.length}`);
 
-        if (signal) {
-            if (signal.status === 'done') {
-                if (signal.files) signal.files.forEach(f => { if (!allNewFiles.includes(f)) allNewFiles.push(f); });
-                if (signal.usage) finalUsage = signal.usage;
-                break;
-            } else if (signal.status === 'continue') {
-                lastHint = signal.hint || 'lanjutkan';
-                if (signal.files_so_far) signal.files_so_far.forEach(f => { if (!allNewFiles.includes(f)) allNewFiles.push(f); });
-                continue;
-            } else if (signal.status === 'question') {
-                questions.push(signal.ask);
-                lastHint = `Asumsikan pilihan terbaik dan lanjutkan`;
-                continue;
-            }
+        if (signal?.status === 'done') {
+            // AI bilang selesai → break
+            if (signal.files) signal.files.forEach(f => { if (!allNewFiles.includes(f)) allNewFiles.push(f); });
+            if (signal.usage) finalUsage = signal.usage;
+            addLog(`[Build] AI selesai (signal done)`);
+            break;
+
+        } else if (signal?.status === 'continue') {
+            // AI minta lanjut → tetap iterasi meski sudah ada file
+            lastHint = signal.hint || 'lanjutkan';
+            if (signal.files_so_far) signal.files_so_far.forEach(f => { if (!allNewFiles.includes(f)) allNewFiles.push(f); });
+            addLog(`[Build] AI lanjut: ${lastHint}`);
+            continue;
+
+        } else if (signal?.status === 'question') {
+            // AI bertanya → jawab otomatis dan lanjut
+            questions.push(signal.ask);
+            lastHint = `Asumsikan pilihan terbaik dan lanjutkan`;
+            addLog(`[Build] AI bertanya: ${signal.ask}`);
+            continue;
+
+        } else if (!signal && allNewFiles.length > 0) {
+            // Tidak ada signal tapi file sudah ada → AI lupa tulis signal, anggap selesai
+            addLog(`[Build] Tidak ada signal tapi file ada → selesai`);
+            break;
+
+        } else {
+            // Tidak ada signal + tidak ada file → lanjut iterasi
+            addLog(`[Build] Tidak ada signal + tidak ada file → lanjut iterasi`);
         }
-
-        if (allNewFiles.length > 0 && iteration >= 2) break;
     }
 
     const finalFiles = allNewFiles.filter(f => fs.existsSync(path.join(nemoDir, f)));
@@ -532,6 +579,13 @@ app.post('/fix', async (req, res) => {
 
 app.get('/queue', (req, res) => {
     res.json({ queue: queue.length, processing: isProcessing, total: queue.length + (isProcessing ? 1 : 0) });
+});
+
+// ── Logs (polling tiap 10 detik dari luar) ───────────────────
+app.get('/logs', (req, res) => {
+    const since = parseInt(req.query.since) || 0;
+    const logs = buildLogs.slice(since);
+    res.json({ logs, total: buildLogs.length, processing: isProcessing });
 });
 
 app.get('/features', async (req, res) => {
