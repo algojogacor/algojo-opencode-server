@@ -174,17 +174,19 @@ function runOpenCode(prompt, sessionId = null) {
         });
 
         child.on('close', (code) => {
+            clearTimeout(timeoutTimer); // bersihkan timer!
             console.log(`[OpenCode] Selesai dengan exit code: ${code}`);
             console.log(`[OpenCode] Total output: ${stdout.length} chars`);
             resolve({ stdout, stderr, error: null });
         });
 
         child.on('error', (err) => {
+            clearTimeout(timeoutTimer); // bersihkan timer!
             console.error(`[OpenCode] Error:`, err.message);
             resolve({ stdout, stderr, error: err });
         });
 
-        setTimeout(() => {
+        const timeoutTimer = setTimeout(() => {
             console.log('[OpenCode] TIMEOUT — killing process');
             child.kill();
             resolve({ stdout, stderr, error: new Error('Timeout') });
@@ -266,7 +268,23 @@ function checkDuplicate(prompt) {
     return null;
 }
 
-async function gitPushAll(files, isfix = false) {
+// Bersihkan JSON signal yang nyasar ke dalam file JS
+function cleanSignalFromFiles(files) {
+    const nemoDir = path.join(BOT_DIR, 'commands', 'nemo');
+    for (const file of files) {
+        const fp = path.join(nemoDir, file);
+        if (!fs.existsSync(fp)) continue;
+        let content = fs.readFileSync(fp, 'utf8');
+        // Hapus JSON signal di akhir file
+        content = content.replace(/\n?\s*\{"status"\s*:\s*"(done|continue|question|error)"[^}]*\}\s*$/g, '');
+        // Hapus juga kalau ada di tengah file (jaga-jaga)
+        content = content.replace(/\{"status"\s*:\s*"(done|continue|question|error)"[^}]*\}/g, '');
+        fs.writeFileSync(fp, content.trim() + '\n', 'utf8');
+        addLog(`[Clean] Signal dibersihkan dari ${file}`);
+    }
+}
+
+
     const repoUrl = BOT_REPO.replace('https://', `https://${GITHUB_TOKEN}@`);
     const commitMsg = isfix
         ? `fix: perbaiki fitur by Algojo AI`
@@ -436,6 +454,8 @@ async function executeBuild({ prompt, requester, groupId, forceUpdate = false })
         return { success: false, iterations: iteration, groupId, message: `Sudah ${iteration} iterasi tapi tidak ada file.` };
     }
 
+    // Bersihkan JSON signal yang nyasar ke file sebelum push
+    cleanSignalFromFiles(finalFiles);
     await gitPushAll(finalFiles);
 
     const features = finalFiles.map(f => f.replace('.js', ''));
@@ -499,33 +519,26 @@ app.post('/build', async (req, res) => {
         });
     }
 
-    // Kalau ada antrian → balas dulu ke client, proses di background via webhook
-    if (queuePos > 0) {
-        // Balas HTTP dulu biar client tidak timeout
-        res.json({
-            success: false,
-            queued: true,
-            position: queuePos,
-            message: `Antrian ke-${queuePos}, estimasi ${queuePos * 3} menit.`
+    // Semua request diproses di background — balas instan agar tidak kena HTTP timeout
+    addToQueue({ prompt, requester, groupId, forceUpdate })
+        .then(result => {
+            // build_log sudah dikirim dari dalam executeBuild
+            // queue_done hanya untuk yang antre
+            if (groupId && queuePos > 0) sendWebhook({ type: 'queue_done', groupId, result });
+        })
+        .catch(e => {
+            if (groupId) sendWebhook({ type: 'queue_error', groupId, error: e.message });
         });
-        // Proses di background, kirim hasil via webhook ke bot WA
-        addToQueue({ prompt, requester, groupId, forceUpdate })
-            .then(result => {
-                if (groupId) sendWebhook({ type: 'queue_done', groupId, result });
-            })
-            .catch(e => {
-                if (groupId) sendWebhook({ type: 'queue_error', groupId, error: e.message });
-            });
-        return;
-    }
 
-    // Langsung proses kalau tidak ada antrian
-    try {
-        const result = await addToQueue({ prompt, requester, groupId, forceUpdate });
-        res.json(result);
-    } catch(error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
+    // Balas instan ke bot WA
+    return res.json({
+        success: true,
+        queued: true,
+        position: queuePos,
+        message: queuePos === 0
+            ? 'Build segera dimulai!'
+            : `Antrian ke-${queuePos}, estimasi ${queuePos * 3} menit.`
+    });
 });
 
 app.post('/fix', async (req, res) => {
@@ -559,6 +572,7 @@ app.post('/fix', async (req, res) => {
 
         if (!fixed) return res.json({ success: false, message: 'Gagal fix setelah 3x' });
 
+        cleanSignalFromFiles([`${feature}.js`]);
         await gitPushAll([`${feature}.js`], true);
 
         // Kirim log fix ke grup
